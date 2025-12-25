@@ -15,8 +15,6 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MultiLabelBinarizer
 from tqdm import tqdm
 
-from utils.cafa_metrics import CAFAMetrics
-
 
 # =============================================================================
 # Optuna Configuration
@@ -271,28 +269,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
 
 
 @torch.no_grad()
-def evaluate(
-    model,
-    dataloader,
-    criterion,
-    device,
-    top_terms: list[str] | None = None,
-    cafa_metrics: CAFAMetrics | None = None,
-):
-    """
-    Evaluate model on validation set.
-
-    Args:
-        model: PyTorch model
-        dataloader: Validation data loader
-        criterion: Loss function
-        device: Device to run on
-        top_terms: List of GO term IDs (required for CAFA metrics)
-        cafa_metrics: CAFAMetrics instance (optional, for weighted F-max)
-
-    Returns:
-        Tuple of (avg_loss, metrics_dict)
-    """
+def evaluate(model, dataloader, criterion, device):
+    """Evaluate model on validation set."""
     model.eval()
     total_loss = 0
     all_preds = []
@@ -313,8 +291,11 @@ def evaluate(
     all_preds = np.concatenate(all_preds, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
 
-    # Calculate basic metrics at fixed threshold
+    # Calculate metrics
+    # Threshold at 0.5 for binary predictions
     binary_preds = (all_preds > 0.5).astype(int)
+
+    # Micro-averaged metrics (treat all predictions as one pool)
     tp = (binary_preds * all_labels).sum()
     fp = (binary_preds * (1 - all_labels)).sum()
     fn = ((1 - binary_preds) * all_labels).sum()
@@ -323,14 +304,7 @@ def evaluate(
     recall = tp / (tp + fn + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
-    metrics = {"precision": precision, "recall": recall, "f1": f1}
-
-    # Calculate CAFA metrics if available
-    if cafa_metrics is not None and top_terms is not None:
-        cafa_results = cafa_metrics.compute_fmax(all_preds, all_labels, top_terms)
-        metrics.update(cafa_results)
-
-    return avg_loss, metrics
+    return avg_loss, {"precision": precision, "recall": recall, "f1": f1}
 
 
 def train(
@@ -404,39 +378,33 @@ def train(
         T_max=training_config.epochs,
     )
 
-    # Initialize CAFA metrics
-    cafa_metrics = CAFAMetrics()
-
     # Training loop
-    best_fmax = 0
+    best_f1 = 0
     for epoch in range(training_config.epochs):
         print(f"\nEpoch {epoch + 1}/{training_config.epochs}")
 
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, metrics = evaluate(
-            model, val_loader, criterion, device, top_terms, cafa_metrics
-        )
+        val_loss, metrics = evaluate(model, val_loader, criterion, device)
         scheduler.step()
 
         print(f"  Train Loss: {train_loss:.4f}")
         print(f"  Val Loss: {val_loss:.4f}")
-        print(f"  F1 (t=0.5): {metrics['f1']:.4f}")
-        print(f"  F-max (weighted): {metrics['fmax_weighted']:.4f} @ t={metrics['threshold_weighted']:.2f}")
-        print(f"  F-max (unweighted): {metrics['fmax_unweighted']:.4f} @ t={metrics['threshold_unweighted']:.2f}")
+        print(f"  Precision: {metrics['precision']:.4f}")
+        print(f"  Recall: {metrics['recall']:.4f}")
+        print(f"  F1: {metrics['f1']:.4f}")
 
-        if metrics["fmax_weighted"] > best_fmax:
-            best_fmax = metrics["fmax_weighted"]
+        if metrics["f1"] > best_f1:
+            best_f1 = metrics["f1"]
             checkpoint = {
                 "model_state_dict": model.state_dict(),
                 "model_config": model_config,
                 "embedding_config": embedding_config,
                 "top_terms": top_terms,
-                "best_threshold": metrics["threshold_weighted"],
             }
             torch.save(checkpoint, "best_model.pt")
             print("  -> Saved best model")
 
-    print(f"\nTraining complete. Best weighted F-max: {best_fmax:.4f}")
+    print(f"\nTraining complete. Best F1: {best_f1:.4f}")
 
     return model, mlb, top_terms
 
@@ -556,29 +524,24 @@ def create_objective(
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-        # Initialize CAFA metrics
-        cafa_metrics = CAFAMetrics()
-
         # Training loop with pruning
-        best_fmax = 0
+        best_f1 = 0
         for epoch in range(epochs):
             train_epoch(model, train_loader, criterion, optimizer, device)
-            val_loss, metrics = evaluate(
-                model, val_loader, criterion, device, top_terms, cafa_metrics
-            )
+            val_loss, metrics = evaluate(model, val_loader, criterion, device)
             scheduler.step()
 
-            fmax = metrics["fmax_weighted"]
-            if fmax > best_fmax:
-                best_fmax = fmax
+            f1 = metrics["f1"]
+            if f1 > best_f1:
+                best_f1 = f1
 
             # Report to Optuna for pruning
-            trial.report(fmax, epoch)
+            trial.report(f1, epoch)
 
             if optuna_config.pruning and trial.should_prune():
                 raise optuna.TrialPruned()
 
-        return best_fmax
+        return best_f1
 
     return objective
 
@@ -613,7 +576,7 @@ def run_optuna_study(
     print("\n" + "=" * 60)
     print("Optuna Study Complete")
     print("=" * 60)
-    print(f"Best trial weighted F-max: {study.best_trial.value:.4f}")
+    print(f"Best trial F1: {study.best_trial.value:.4f}")
     print("\nBest hyperparameters:")
     for key, value in study.best_trial.params.items():
         print(f"  {key}: {value}")
