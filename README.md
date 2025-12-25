@@ -3,6 +3,12 @@ Code for my submissions to CAFA6 Protein Function Prediction Competition on Kagg
 
 Download data into input folder using: `kaggle competitions download -c cafa-6-protein-function-prediction`
 
+## Setup
+- todo
+- need to install torch separately similar to: `uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130`
+
+
+## Random notes
 CAFA 5 solution findings
 - Logistic regression on ESM-1b yielded best perforamnce
 - They did train/val split on species
