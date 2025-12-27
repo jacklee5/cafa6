@@ -51,22 +51,22 @@ class OptunaConfig:
 @dataclass
 class EmbeddingConfig:
     """Configuration for embeddings dataset - easy to swap."""
-    train_embeddings_path: str = "data/train/embeddings.npy"
-    train_ids_path: str = "data/train/proteins.pkl"
-    val_embeddings_path: str = "data/val/embeddings.npy"
-    val_ids_path: str = "data/val/proteins.pkl"
+    train_embeddings_path: str = "input/esm1b-embeddings/train_esm1b_embeddings.npy"
+    train_ids_path: str = "input/esm1b-embeddings/train_ids.pkl"
+    val_embeddings_path: str | None = None  # None = no validation (train on all data)
+    val_ids_path: str | None = None
     # Embedding pooling selection: "all", "mean", "max", "min"
     # The embeddings are concatenated as [mean, max, min] poolings (each 1/3 of dims)
-    pooling: str = "all"
+    pooling: str = "mean"
 
 
 @dataclass
 class ModelConfig:
     """Configuration for the MLP architecture."""
     # Hidden layer sizes (empty list = pure logistic regression)
-    hidden_layers: list[int] = field(default_factory=lambda: [1024, 512])
-    dropout: float = 0.3
-    activation: str = "relu"  # "relu", "gelu", "silu"
+    hidden_layers: list[int] = field(default_factory=lambda: [1024])
+    dropout: float = 0.1006961784393873
+    activation: str = "gelu"  # "relu", "gelu", "silu"
     batch_norm: bool = True
 
 
@@ -74,9 +74,9 @@ class ModelConfig:
 class TrainingConfig:
     """Configuration for training."""
     top_k_labels: int = 1000  # Number of most frequent GO terms to predict
-    batch_size: int = 256
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-5
+    batch_size: int = 128
+    learning_rate: float = 0.002320547782435886
+    weight_decay: float = 4.056106044748933e-05
     epochs: int = 20
     seed: int = 42
     num_workers: int = 4
@@ -131,6 +131,7 @@ class MLPClassifier(nn.Module):
         layers = []
         prev_dim = input_dim
 
+        layers.append(nn.Dropout(config.dropout))
         for hidden_dim in config.hidden_layers:
             layers.append(nn.Linear(prev_dim, hidden_dim))
             if config.batch_norm:
@@ -191,13 +192,17 @@ def load_embeddings(config: EmbeddingConfig):
     with open(config.train_ids_path, "rb") as f:
         train_ids = pickle.load(f)
 
-    val_embeddings = np.load(config.val_embeddings_path)
-    with open(config.val_ids_path, "rb") as f:
-        val_ids = pickle.load(f)
-
     # Apply pooling selection
     train_embeddings = slice_embeddings_by_pooling(train_embeddings, config.pooling)
-    val_embeddings = slice_embeddings_by_pooling(val_embeddings, config.pooling)
+
+    # Load validation embeddings if paths provided
+    val_embeddings = None
+    val_ids = None
+    if config.val_embeddings_path and config.val_ids_path:
+        val_embeddings = np.load(config.val_embeddings_path)
+        with open(config.val_ids_path, "rb") as f:
+            val_ids = pickle.load(f)
+        val_embeddings = slice_embeddings_by_pooling(val_embeddings, config.pooling)
 
     print(f"Pooling mode: {config.pooling} -> embedding dim: {train_embeddings.shape[1]}")
 
@@ -222,7 +227,10 @@ def load_labels(
 
     # Get top-k most frequent terms
     term_counts = terms_df["term"].value_counts()
-    top_terms = term_counts.head(top_k).index.tolist()
+    if not top_k:
+        top_terms = term_counts.index.tolist()
+    else:
+        top_terms = term_counts.head(top_k).index.tolist()
 
     print(f"Total unique terms: {len(term_counts)}")
     print(f"Using top {top_k} terms (min count: {term_counts.iloc[top_k-1]})")
@@ -327,34 +335,40 @@ def train(
         embedding_config
     )
     print(f"Train embeddings shape: {train_embeddings.shape}")
-    print(f"Val embeddings shape: {val_embeddings.shape}")
+    has_validation = val_embeddings is not None
+    if has_validation:
+        print(f"Val embeddings shape: {val_embeddings.shape}")
+    else:
+        print("No validation set - training on all data")
 
     print("Loading labels...")
     train_labels, mlb, top_terms = load_labels(
         train_ids,
         training_config.top_k_labels,
     )
-    val_labels, _, _ = load_labels(
-        val_ids,
-        training_config.top_k_labels,
-    )
     print(f"Train labels shape: {train_labels.shape}")
-    print(f"Val labels shape: {val_labels.shape}")
+
+    val_loader = None
+    if has_validation:
+        val_labels, _, _ = load_labels(
+            val_ids,
+            training_config.top_k_labels,
+        )
+        print(f"Val labels shape: {val_labels.shape}")
+        val_dataset = ProteinDataset(val_embeddings, val_labels)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=training_config.batch_size,
+            shuffle=False,
+            num_workers=training_config.num_workers,
+            pin_memory=True,
+        )
 
     train_dataset = ProteinDataset(train_embeddings, train_labels)
-    val_dataset = ProteinDataset(val_embeddings, val_labels)
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=training_config.batch_size,
         shuffle=True,
-        num_workers=training_config.num_workers,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=training_config.batch_size,
-        shuffle=False,
         num_workers=training_config.num_workers,
         pin_memory=True,
     )
@@ -384,27 +398,39 @@ def train(
         print(f"\nEpoch {epoch + 1}/{training_config.epochs}")
 
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, metrics = evaluate(model, val_loader, criterion, device)
         scheduler.step()
-
         print(f"  Train Loss: {train_loss:.4f}")
-        print(f"  Val Loss: {val_loss:.4f}")
-        print(f"  Precision: {metrics['precision']:.4f}")
-        print(f"  Recall: {metrics['recall']:.4f}")
-        print(f"  F1: {metrics['f1']:.4f}")
 
-        if metrics["f1"] > best_f1:
-            best_f1 = metrics["f1"]
-            checkpoint = {
-                "model_state_dict": model.state_dict(),
-                "model_config": model_config,
-                "embedding_config": embedding_config,
-                "top_terms": top_terms,
-            }
-            torch.save(checkpoint, "best_model.pt")
-            print("  -> Saved best model")
+        if has_validation:
+            val_loss, metrics = evaluate(model, val_loader, criterion, device)
+            print(f"  Val Loss: {val_loss:.4f}")
+            print(f"  Precision: {metrics['precision']:.4f}")
+            print(f"  Recall: {metrics['recall']:.4f}")
+            print(f"  F1: {metrics['f1']:.4f}")
 
-    print(f"\nTraining complete. Best F1: {best_f1:.4f}")
+            if metrics["f1"] > best_f1:
+                best_f1 = metrics["f1"]
+                checkpoint = {
+                    "model_state_dict": model.state_dict(),
+                    "model_config": model_config,
+                    "embedding_config": embedding_config,
+                    "top_terms": top_terms,
+                }
+                torch.save(checkpoint, "best_model.pt")
+                print("  -> Saved best model")
+
+    # Save final model if no validation (train on all data for submission)
+    if not has_validation:
+        checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "model_config": model_config,
+            "embedding_config": embedding_config,
+            "top_terms": top_terms,
+        }
+        torch.save(checkpoint, "best_model.pt")
+        print("\nSaved final model (trained on all data)")
+    else:
+        print(f"\nTraining complete. Best F1: {best_f1:.4f}")
 
     return model, mlb, top_terms
 
@@ -622,7 +648,13 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     args = parser.parse_args()
 
-    embedding_config = EmbeddingConfig()
+    embedding_config = EmbeddingConfig(
+        train_embeddings_path="data/train/embeddings_esm2.npy",
+        train_ids_path="data/train/proteins.pkl",
+        val_embeddings_path="data/val/embeddings_esm2.npy",
+        val_ids_path="data/val/proteins.pkl",
+        pooling="all"
+    )
 
     if args.optuna:
         # Run Optuna hyperparameter optimization
@@ -637,19 +669,19 @@ if __name__ == "__main__":
             epochs=args.epochs,
         )
     else:
-        # Standard training with default hyperparameters
+        # Standard training with best hyperparameters from Optuna
         model_config = ModelConfig(
-            hidden_layers=[1024, 512],
-            dropout=0.3,
-            activation="relu",
-            batch_norm=True,
+            hidden_layers=[1024],
+            dropout=0.1006961784393873,
+            activation="gelu",
+            batch_norm=False,
         )
 
         training_config = TrainingConfig(
             top_k_labels=1000,
-            batch_size=256,
-            learning_rate=1e-3,
-            weight_decay=1e-5,
+            batch_size=128,
+            learning_rate=0.002320547782435886,
+            weight_decay=4.056106044748933e-05,
             epochs=args.epochs,
             seed=42,
         )

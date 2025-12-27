@@ -12,6 +12,7 @@ import torch
 from tqdm import tqdm
 
 from lr_esm_train import (
+    EmbeddingConfig,
     ModelConfig,
     MLPClassifier,
     slice_embeddings_by_pooling,

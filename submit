@@ -1,0 +1,2 @@
+#!/bin/bash
+kaggle competitions submit -c cafa-6-protein-function-prediction -f submissions/submission.tsv -m Submission
