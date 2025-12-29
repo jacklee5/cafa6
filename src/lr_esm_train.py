@@ -10,38 +10,12 @@ import numpy as np
 import optuna
 import pandas as pd
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from sklearn.preprocessing import MultiLabelBinarizer
-from tqdm import tqdm
 
-
-# =============================================================================
-# Optuna Configuration
-# =============================================================================
-
-@dataclass
-class OptunaConfig:
-    """Configuration for Optuna hyperparameter optimization."""
-    n_trials: int = 50
-    study_name: str = "protein_mlp_optimization"
-    storage: str | None = None  # e.g., "sqlite:///optuna_study.db"
-    pruning: bool = True
-    # Search spaces
-    hidden_layer_choices: list[list[int]] = field(default_factory=lambda: [
-        [],  # logistic regression
-        [512],
-        [1024],
-        [512, 256],
-        [1024, 512],
-        [1024, 512, 256],
-    ])
-    dropout_range: tuple[float, float] = (0.1, 0.5)
-    activation_choices: list[str] = field(default_factory=lambda: ["relu", "gelu", "silu"])
-    top_k_labels: int | None = None  # None = optimize, int = fixed value
-    batch_size_choices: list[int] = field(default_factory=lambda: [128, 256, 512])
-    learning_rate_range: tuple[float, float] = (1e-5, 1e-2)
-    weight_decay_range: tuple[float, float] = (1e-6, 1e-3)
+from models import ESMModel
+from models.ESMModel import ESMSearchSpace
+from utils.optuna import OptunaOptimizer, OptunaStudyConfig
 
 
 # =============================================================================
@@ -61,16 +35,6 @@ class EmbeddingConfig:
 
 
 @dataclass
-class ModelConfig:
-    """Configuration for the MLP architecture."""
-    # Hidden layer sizes (empty list = pure logistic regression)
-    hidden_layers: list[int] = field(default_factory=lambda: [1024])
-    dropout: float = 0.1006961784393873
-    activation: str = "gelu"  # "relu", "gelu", "silu"
-    batch_norm: bool = True
-
-
-@dataclass
 class TrainingConfig:
     """Configuration for training."""
     top_k_labels: int = 1000  # Number of most frequent GO terms to predict
@@ -80,6 +44,14 @@ class TrainingConfig:
     epochs: int = 20
     seed: int = 42
     num_workers: int = 4
+    # Model architecture
+    hidden_layers: list[int] = field(default_factory=lambda: [1024])
+    dropout: float = 0.1006961784393873
+    activation: str = "gelu"
+    batch_norm: bool = True
+    # Checkpointing
+    use_checkpoint: bool = True
+    checkpoint_path: str = "checkpoints"
 
 
 # =============================================================================
@@ -98,55 +70,6 @@ class ProteinDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.embeddings[idx], self.labels[idx]
-
-
-# =============================================================================
-# Model
-# =============================================================================
-
-class MLPClassifier(nn.Module):
-    """
-    Multi-layer perceptron for multi-label classification.
-
-    With empty hidden_layers, this is equivalent to logistic regression.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        config: ModelConfig,
-    ):
-        super().__init__()
-
-        # Build activation function
-        activations = {
-            "relu": nn.ReLU,
-            "gelu": nn.GELU,
-            "silu": nn.SiLU,
-        }
-        activation_fn = activations.get(config.activation, nn.ReLU)
-
-        # Build layers
-        layers = []
-        prev_dim = input_dim
-
-        layers.append(nn.Dropout(config.dropout))
-        for hidden_dim in config.hidden_layers:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            if config.batch_norm:
-                layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(activation_fn())
-            layers.append(nn.Dropout(config.dropout))
-            prev_dim = hidden_dim
-
-        # Output layer (logistic regression layer)
-        layers.append(nn.Linear(prev_dim, output_dim))
-
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.network(x)
 
 
 # =============================================================================
@@ -256,79 +179,11 @@ def load_labels(
 # Training
 # =============================================================================
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0
-
-    for embeddings, labels in tqdm(dataloader, desc="Training", leave=False):
-        embeddings = embeddings.to(device)
-        labels = labels.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(embeddings)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * embeddings.size(0)
-
-    return total_loss / len(dataloader.dataset)
-
-
-@torch.no_grad()
-def evaluate(model, dataloader, criterion, device):
-    """Evaluate model on validation set."""
-    model.eval()
-    total_loss = 0
-    all_preds = []
-    all_labels = []
-
-    for embeddings, labels in tqdm(dataloader, desc="Evaluating", leave=False):
-        embeddings = embeddings.to(device)
-        labels = labels.to(device)
-
-        outputs = model(embeddings)
-        loss = criterion(outputs, labels)
-
-        total_loss += loss.item() * embeddings.size(0)
-        all_preds.append(torch.sigmoid(outputs).cpu().numpy())
-        all_labels.append(labels.cpu().numpy())
-
-    avg_loss = total_loss / len(dataloader.dataset)
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_labels = np.concatenate(all_labels, axis=0)
-
-    # Calculate metrics
-    # Threshold at 0.5 for binary predictions
-    binary_preds = (all_preds > 0.5).astype(int)
-
-    # Micro-averaged metrics (treat all predictions as one pool)
-    tp = (binary_preds * all_labels).sum()
-    fp = (binary_preds * (1 - all_labels)).sum()
-    fn = ((1 - binary_preds) * all_labels).sum()
-
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-    return avg_loss, {"precision": precision, "recall": recall, "f1": f1}
-
-
 def train(
     embedding_config: EmbeddingConfig,
-    model_config: ModelConfig,
     training_config: TrainingConfig,
 ):
-    """Main training function."""
-    # Set seeds
-    torch.manual_seed(training_config.seed)
-    np.random.seed(training_config.seed)
-
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
+    """Main training function using ESMModel."""
     # Load data
     print("Loading embeddings...")
     train_embeddings, train_ids, val_embeddings, val_ids = load_embeddings(
@@ -348,7 +203,10 @@ def train(
     )
     print(f"Train labels shape: {train_labels.shape}")
 
-    val_loader = None
+    # Create datasets
+    train_dataset = ProteinDataset(train_embeddings, train_labels)
+
+    val_dataset = None
     if has_validation:
         val_labels, _, _ = load_labels(
             val_ids,
@@ -356,283 +214,105 @@ def train(
         )
         print(f"Val labels shape: {val_labels.shape}")
         val_dataset = ProteinDataset(val_embeddings, val_labels)
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=training_config.batch_size,
-            shuffle=False,
-            num_workers=training_config.num_workers,
-            pin_memory=True,
-        )
 
-    train_dataset = ProteinDataset(train_embeddings, train_labels)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=training_config.batch_size,
-        shuffle=True,
-        num_workers=training_config.num_workers,
-        pin_memory=True,
-    )
+    # Create ESMModel config
+    config = {
+        "model": {
+            "hidden_layers": training_config.hidden_layers,
+            "dropout": training_config.dropout,
+            "activation": training_config.activation,
+            "batch_norm": training_config.batch_norm,
+        },
+        "training": {
+            "batch_size": training_config.batch_size,
+            "learning_rate": training_config.learning_rate,
+            "weight_decay": training_config.weight_decay,
+            "epochs": training_config.epochs,
+            "num_workers": training_config.num_workers,
+            "seed": training_config.seed,
+            "use_checkpoint": training_config.use_checkpoint,
+            "checkpoint_path": training_config.checkpoint_path,
+        },
+    }
 
-    # Model
-    input_dim = train_embeddings.shape[1]
-    output_dim = len(top_terms)
-    model = MLPClassifier(input_dim, output_dim, model_config).to(device)
-    print(f"\nModel architecture:\n{model}")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=training_config.learning_rate,
-        weight_decay=training_config.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=training_config.epochs,
-    )
-
-    # Training loop
-    best_f1 = 0
-    for epoch in range(training_config.epochs):
-        print(f"\nEpoch {epoch + 1}/{training_config.epochs}")
-
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        scheduler.step()
-        print(f"  Train Loss: {train_loss:.4f}")
-
-        if has_validation:
-            val_loss, metrics = evaluate(model, val_loader, criterion, device)
-            print(f"  Val Loss: {val_loss:.4f}")
-            print(f"  Precision: {metrics['precision']:.4f}")
-            print(f"  Recall: {metrics['recall']:.4f}")
-            print(f"  F1: {metrics['f1']:.4f}")
-
-            if metrics["f1"] > best_f1:
-                best_f1 = metrics["f1"]
-                checkpoint = {
-                    "model_state_dict": model.state_dict(),
-                    "model_config": model_config,
-                    "embedding_config": embedding_config,
-                    "top_terms": top_terms,
-                }
-                torch.save(checkpoint, "best_model.pt")
-                print("  -> Saved best model")
+    # Create and train model
+    model = ESMModel(config)
+    model.train(train_dataset, val_dataset)
 
     # Save final model if no validation (train on all data for submission)
     if not has_validation:
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "model_config": model_config,
-            "embedding_config": embedding_config,
-            "top_terms": top_terms,
-        }
-        torch.save(checkpoint, "best_model.pt")
-        print("\nSaved final model (trained on all data)")
-    else:
-        print(f"\nTraining complete. Best F1: {best_f1:.4f}")
+        model.save_checkpoint(
+            training_config.checkpoint_path,
+            extra_data={
+                "top_terms": top_terms,
+                "embedding_config": embedding_config,
+            }
+        )
+        print("Saved final model (trained on all data)")
 
     return model, mlb, top_terms
 
 
 # =============================================================================
-# Optuna Objective
+# Optuna Hyperparameter Optimization
 # =============================================================================
 
-def create_objective(
+def run_optuna_optimization(
     embedding_config: EmbeddingConfig,
-    optuna_config: OptunaConfig,
+    search_space: ESMSearchSpace,
+    study_config: OptunaStudyConfig,
+    top_k_labels: int = 1000,
     epochs: int = 20,
     seed: int = 42,
     num_workers: int = 4,
-):
-    """Create an Optuna objective function with pre-loaded embeddings."""
-    # Pre-load embeddings once (they don't change between trials)
-    print("Pre-loading embeddings for Optuna study...")
-    train_embeddings_full = np.load(embedding_config.train_embeddings_path)
-    with open(embedding_config.train_ids_path, "rb") as f:
-        train_ids = pickle.load(f)
-    val_embeddings_full = np.load(embedding_config.val_embeddings_path)
-    with open(embedding_config.val_ids_path, "rb") as f:
-        val_ids = pickle.load(f)
+) -> optuna.Study:
+    """
+    Run Optuna hyperparameter optimization.
 
-    # Apply pooling
-    train_embeddings = slice_embeddings_by_pooling(train_embeddings_full, embedding_config.pooling)
-    val_embeddings = slice_embeddings_by_pooling(val_embeddings_full, embedding_config.pooling)
-    print(f"Embeddings loaded: train {train_embeddings.shape}, val {val_embeddings.shape}")
+    Args:
+        embedding_config: Configuration for loading embeddings
+        search_space: ESMSearchSpace defining hyperparameter search ranges
+        study_config: OptunaStudyConfig for study settings
+        top_k_labels: Number of GO terms to predict (fixed, not optimized)
+        epochs: Number of training epochs per trial
+        seed: Random seed
+        num_workers: Number of data loader workers
 
-    def objective(trial: optuna.Trial) -> float:
-        """Optuna objective function - returns validation F1 score."""
-        # Sample hyperparameters
-        hidden_layers = trial.suggest_categorical(
-            "hidden_layers",
-            [str(h) for h in optuna_config.hidden_layer_choices]
-        )
-        hidden_layers = eval(hidden_layers)  # Convert string back to list
+    Returns:
+        Completed Optuna study
+    """
+    # Pre-load embeddings and labels ONCE (top_k_labels is fixed)
+    print("Loading embeddings...")
+    train_embeddings, train_ids, val_embeddings, val_ids = load_embeddings(
+        embedding_config
+    )
+    print(f"Train embeddings shape: {train_embeddings.shape}")
 
-        dropout = trial.suggest_float(
-            "dropout",
-            optuna_config.dropout_range[0],
-            optuna_config.dropout_range[1],
-        )
-        activation = trial.suggest_categorical(
-            "activation",
-            optuna_config.activation_choices,
-        )
-        if optuna_config.top_k_labels is not None:
-            top_k_labels = optuna_config.top_k_labels
-        else:
-            top_k_labels = trial.suggest_int("top_k_labels", 500, 2000, step=100)
-        batch_size = trial.suggest_categorical(
-            "batch_size",
-            optuna_config.batch_size_choices,
-        )
-        learning_rate = trial.suggest_float(
-            "learning_rate",
-            optuna_config.learning_rate_range[0],
-            optuna_config.learning_rate_range[1],
-            log=True,
-        )
-        weight_decay = trial.suggest_float(
-            "weight_decay",
-            optuna_config.weight_decay_range[0],
-            optuna_config.weight_decay_range[1],
-            log=True,
-        )
+    if val_embeddings is None:
+        raise ValueError("Validation set required for Optuna optimization")
+    print(f"Val embeddings shape: {val_embeddings.shape}")
 
-        # Set seeds
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+    print("Loading labels...")
+    train_labels, _, top_terms = load_labels(train_ids, top_k_labels)
+    val_labels, _, _ = load_labels(val_ids, top_k_labels)
+    print(f"Train labels shape: {train_labels.shape}")
+    print(f"Val labels shape: {val_labels.shape}")
 
-        # Device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Create datasets once
+    train_dataset = ProteinDataset(train_embeddings, train_labels)
+    val_dataset = ProteinDataset(val_embeddings, val_labels)
 
-        # Load labels with sampled top_k
-        train_labels, _, top_terms = load_labels(train_ids, top_k_labels)
-        val_labels, _, _ = load_labels(val_ids, top_k_labels)
-
-        # Create datasets and loaders
-        train_dataset = ProteinDataset(train_embeddings, train_labels)
-        val_dataset = ProteinDataset(val_embeddings, val_labels)
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-        )
-
-        # Create model
-        model_config = ModelConfig(
-            hidden_layers=hidden_layers,
-            dropout=dropout,
-            activation=activation,
-            batch_norm=True,
-        )
-        input_dim = train_embeddings.shape[1]
-        output_dim = len(top_terms)
-        model = MLPClassifier(input_dim, output_dim, model_config).to(device)
-
-        # Loss and optimizer
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay,
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-        # Training loop with pruning
-        best_f1 = 0
-        for epoch in range(epochs):
-            train_epoch(model, train_loader, criterion, optimizer, device)
-            val_loss, metrics = evaluate(model, val_loader, criterion, device)
-            scheduler.step()
-
-            f1 = metrics["f1"]
-            if f1 > best_f1:
-                best_f1 = f1
-
-            # Report to Optuna for pruning
-            trial.report(f1, epoch)
-
-            if optuna_config.pruning and trial.should_prune():
-                raise optuna.TrialPruned()
-
-        return best_f1
-
-    return objective
-
-
-def run_optuna_study(
-    embedding_config: EmbeddingConfig,
-    optuna_config: OptunaConfig,
-    epochs: int = 20,
-    seed: int = 42,
-):
-    """Run Optuna hyperparameter optimization study."""
-    objective = create_objective(
-        embedding_config,
-        optuna_config,
+    # Create and run optimizer
+    optimizer = OptunaOptimizer(ESMModel, search_space, study_config)
+    study = optimizer.run_study(
+        train_dataset,
+        val_dataset,
         epochs=epochs,
         seed=seed,
+        num_workers=num_workers,
     )
-
-    # Create or load study
-    pruner = optuna.pruners.MedianPruner() if optuna_config.pruning else optuna.pruners.NopPruner()
-    study = optuna.create_study(
-        study_name=optuna_config.study_name,
-        storage=optuna_config.storage,
-        direction="maximize",
-        pruner=pruner,
-        load_if_exists=True,
-    )
-
-    study.optimize(objective, n_trials=optuna_config.n_trials, show_progress_bar=True)
-
-    # Print results
-    print("\n" + "=" * 60)
-    print("Optuna Study Complete")
-    print("=" * 60)
-    print(f"Best trial F1: {study.best_trial.value:.4f}")
-    print("\nBest hyperparameters:")
-    for key, value in study.best_trial.params.items():
-        print(f"  {key}: {value}")
 
     return study
-
-
-# =============================================================================
-# Inference
-# =============================================================================
-
-@torch.no_grad()
-def predict(
-    model: nn.Module,
-    embeddings: np.ndarray,
-    device: torch.device,
-    batch_size: int = 256,
-) -> np.ndarray:
-    """Generate predictions for embeddings."""
-    model.eval()
-    dataset = torch.from_numpy(embeddings).float()
-    all_preds = []
-
-    for i in range(0, len(dataset), batch_size):
-        batch = dataset[i : i + batch_size].to(device)
-        outputs = model(batch)
-        probs = torch.sigmoid(outputs).cpu().numpy()
-        all_preds.append(probs)
-
-    return np.concatenate(all_preds, axis=0)
 
 
 # =============================================================================
@@ -658,25 +338,29 @@ if __name__ == "__main__":
 
     if args.optuna:
         # Run Optuna hyperparameter optimization
-        optuna_config = OptunaConfig(
-            n_trials=args.n_trials,
-            pruning=True,
-            top_k_labels=1000,  # Fixed; set to None to optimize
+        search_space = ESMSearchSpace(
+            hidden_layer_choices=[[], [512], [1024], [512, 256], [1024, 512]],
+            dropout_range=(0.1, 0.5),
+            activation_choices=["relu", "gelu", "silu"],
+            batch_size_choices=[128, 256, 512],
+            learning_rate_range=(1e-5, 1e-2),
+            weight_decay_range=(1e-6, 1e-3),
         )
-        study = run_optuna_study(
+        study_config = OptunaStudyConfig(
+            n_trials=args.n_trials,
+            study_name="protein_mlp_optimization",
+            pruning=True,
+            metric="f1",
+        )
+        study = run_optuna_optimization(
             embedding_config,
-            optuna_config,
+            search_space,
+            study_config,
+            top_k_labels=1000,
             epochs=args.epochs,
         )
     else:
         # Standard training with best hyperparameters from Optuna
-        model_config = ModelConfig(
-            hidden_layers=[1024],
-            dropout=0.1006961784393873,
-            activation="gelu",
-            batch_norm=False,
-        )
-
         training_config = TrainingConfig(
             top_k_labels=1000,
             batch_size=128,
@@ -684,10 +368,15 @@ if __name__ == "__main__":
             weight_decay=4.056106044748933e-05,
             epochs=args.epochs,
             seed=42,
+            hidden_layers=[1024],
+            dropout=0.1006961784393873,
+            activation="gelu",
+            batch_norm=False,
+            use_checkpoint=True,
+            checkpoint_path="checkpoints",
         )
 
         model, mlb, top_terms = train(
             embedding_config,
-            model_config,
             training_config,
         )

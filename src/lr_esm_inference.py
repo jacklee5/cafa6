@@ -8,15 +8,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
 
-from lr_esm_train import (
-    EmbeddingConfig,
-    ModelConfig,
-    MLPClassifier,
-    slice_embeddings_by_pooling,
-)
+from models import ESMModel
+from lr_esm_train import slice_embeddings_by_pooling
 
 
 # =============================================================================
@@ -36,7 +31,6 @@ class InferenceConfig:
     # Output
     output_path: str = "submission.tsv"
     threshold: float = 0.01  # Minimum probability to include prediction
-    batch_size: int = 256
 
 
 # =============================================================================
@@ -59,44 +53,9 @@ def load_test_embeddings(
     return embeddings, ids
 
 
-def load_checkpoint(model_path: str, device: torch.device) -> dict:
-    """
-    Load checkpoint containing model weights, config, and GO terms.
-
-    Returns dict with keys:
-        - model_state_dict: model weights
-        - model_config: ModelConfig used during training
-        - embedding_config: EmbeddingConfig used during training
-        - top_terms: list of GO term IDs
-    """
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    return checkpoint
-
-
 # =============================================================================
-# Inference
+# Submission Generation
 # =============================================================================
-
-@torch.no_grad()
-def predict(
-    model: torch.nn.Module,
-    embeddings: np.ndarray,
-    device: torch.device,
-    batch_size: int = 256,
-) -> np.ndarray:
-    """Generate predictions for embeddings."""
-    model.eval()
-    dataset = torch.from_numpy(embeddings).float()
-    all_preds = []
-
-    for i in tqdm(range(0, len(dataset), batch_size), desc="Predicting"):
-        batch = dataset[i : i + batch_size].to(device)
-        outputs = model(batch)
-        probs = torch.sigmoid(outputs).cpu().numpy()
-        all_preds.append(probs)
-
-    return np.concatenate(all_preds, axis=0)
-
 
 def generate_submission(
     protein_ids: list[str],
@@ -150,20 +109,23 @@ def generate_submission(
 
 def run_inference(config: InferenceConfig):
     """Main inference function."""
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Load model from checkpoint
+    print(f"Loading model from {config.model_path}...")
+    model = ESMModel.load_from_checkpoint(config.model_path)
 
-    # Load checkpoint (contains model config and GO terms from training)
-    print(f"\nLoading checkpoint from {config.model_path}...")
-    checkpoint = load_checkpoint(config.model_path, device)
-
-    model_config: ModelConfig = checkpoint["model_config"]
-    embedding_config = checkpoint["embedding_config"]
+    # Get extra data saved with checkpoint (top_terms, embedding_config)
+    import torch
+    checkpoint = torch.load(config.model_path, map_location="cpu", weights_only=False)
     top_terms: list[str] = checkpoint["top_terms"]
+    embedding_config = checkpoint.get("embedding_config")
 
-    print(f"  Model architecture: {model_config.hidden_layers}")
-    print(f"  Pooling mode: {embedding_config.pooling}")
+    # Determine pooling mode
+    if embedding_config is not None:
+        pooling = embedding_config.pooling
+    else:
+        pooling = "all"  # Default fallback
+
+    print(f"  Pooling mode: {pooling}")
     print(f"  GO terms: {len(top_terms)}")
 
     # Load test embeddings with same pooling as training
@@ -171,29 +133,12 @@ def run_inference(config: InferenceConfig):
     test_embeddings, test_ids = load_test_embeddings(
         config.test_embeddings_path,
         config.test_ids_path,
-        embedding_config.pooling,
+        pooling,
     )
-
-    # Create model with same architecture as training
-    input_dim = test_embeddings.shape[1]
-    output_dim = len(top_terms)
-
-    # Override dropout for inference
-    inference_model_config = ModelConfig(
-        hidden_layers=model_config.hidden_layers,
-        dropout=0.0,
-        activation=model_config.activation,
-        batch_norm=model_config.batch_norm,
-    )
-
-    model = MLPClassifier(input_dim, output_dim, inference_model_config)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
-    print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
 
     # Run inference
     print("\nRunning inference...")
-    predictions = predict(model, test_embeddings, device, config.batch_size)
+    predictions = model.predict(test_embeddings)
     print(f"Predictions shape: {predictions.shape}")
 
     # Generate submission
@@ -211,10 +156,9 @@ def run_inference(config: InferenceConfig):
 
 if __name__ == "__main__":
     config = InferenceConfig(
-        model_path="models/best_model.pt",
+        model_path="checkpoints/esm_20241229_120000.pt",  # Update with actual checkpoint
         output_path="submissions/submission.tsv",
         threshold=0.01,
-        batch_size=256,
     )
 
     run_inference(config)
