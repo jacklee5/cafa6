@@ -3,15 +3,15 @@ Run inference on the model generated in lr_esm_train.py.
 Generates a submission file in the competition format.
 """
 
-import pickle
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import torch
 from tqdm import tqdm
 
+from dataset import EmbeddingDataset
 from models import ESMModel
-from lr_esm_train import slice_embeddings_by_pooling
 
 
 # =============================================================================
@@ -31,26 +31,6 @@ class InferenceConfig:
     # Output
     output_path: str = "submission.tsv"
     threshold: float = 0.01  # Minimum probability to include prediction
-
-
-# =============================================================================
-# Data Loading
-# =============================================================================
-
-def load_test_embeddings(
-    embeddings_path: str,
-    ids_path: str,
-    pooling: str,
-) -> tuple[np.ndarray, list[str]]:
-    """Load test embeddings and IDs."""
-    embeddings = np.load(embeddings_path)
-    with open(ids_path, "rb") as f:
-        ids = pickle.load(f)
-
-    embeddings = slice_embeddings_by_pooling(embeddings, pooling)
-    print(f"Loaded {len(ids)} test proteins with embedding dim {embeddings.shape[1]}")
-
-    return embeddings, ids
 
 
 # =============================================================================
@@ -113,28 +93,25 @@ def run_inference(config: InferenceConfig):
     print(f"Loading model from {config.model_path}...")
     model = ESMModel.load_from_checkpoint(config.model_path)
 
-    # Get extra data saved with checkpoint (top_terms, embedding_config)
-    import torch
+    # Get extra data saved with checkpoint (top_terms, pooling)
     checkpoint = torch.load(config.model_path, map_location="cpu", weights_only=False)
     top_terms: list[str] = checkpoint["top_terms"]
-    embedding_config = checkpoint.get("embedding_config")
-
-    # Determine pooling mode
-    if embedding_config is not None:
-        pooling = embedding_config.pooling
-    else:
-        pooling = "all"  # Default fallback
+    pooling = checkpoint.get("pooling", "all")
 
     print(f"  Pooling mode: {pooling}")
     print(f"  GO terms: {len(top_terms)}")
 
-    # Load test embeddings with same pooling as training
+    # Load test embeddings (no labels for inference)
     print("\nLoading test embeddings...")
-    test_embeddings, test_ids = load_test_embeddings(
-        config.test_embeddings_path,
-        config.test_ids_path,
-        pooling,
+    test_dataset = EmbeddingDataset(
+        embeddings_path=config.test_embeddings_path,
+        ids_path=config.test_ids_path,
+        pooling=pooling,
+        terms_path=None,  # No labels for inference
     )
+
+    # Get embeddings as numpy array for prediction
+    test_embeddings = test_dataset.embeddings.numpy()
 
     # Run inference
     print("\nRunning inference...")
@@ -144,7 +121,7 @@ def run_inference(config: InferenceConfig):
     # Generate submission
     print("\nGenerating submission file...")
     generate_submission(
-        test_ids,
+        test_dataset.ids,
         predictions,
         top_terms,
         config.output_path,
