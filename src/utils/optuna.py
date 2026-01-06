@@ -12,6 +12,7 @@ import optuna
 from torch.utils.data import Dataset
 
 if TYPE_CHECKING:
+    import wandb
     from models.Model import TrainingCallback
 
 
@@ -40,6 +41,7 @@ class OptunaCallback:
     Training callback that reports metrics to Optuna and handles pruning.
 
     Implements the TrainingCallback protocol for use with Model.train().
+    Optionally integrates with Weights & Biases for logging.
     """
 
     def __init__(
@@ -47,6 +49,9 @@ class OptunaCallback:
         trial: optuna.Trial,
         metric: str = "f1",
         pruning: bool = True,
+        wandb_project: str | None = None,
+        wandb_group: str | None = None,
+        model_config: dict | None = None,
     ):
         """
         Initialize the callback.
@@ -55,11 +60,34 @@ class OptunaCallback:
             trial: Optuna trial object
             metric: Key in epoch_metrics to report to Optuna (e.g., "f1", "val_loss")
             pruning: Whether to check for pruning after each epoch
+            wandb_project: W&B project name (enables W&B logging if provided)
+            wandb_group: W&B group name for organizing trials (typically study name)
+            model_config: Model configuration to log to W&B
         """
         self.trial = trial
         self.metric = metric
         self.pruning = pruning
         self.best_value = 0.0
+        self.wandb_run = None
+
+        # Initialize W&B if project provided
+        if wandb_project:
+            import wandb
+
+            # Combine trial params with model config
+            config = dict(trial.params)
+            if model_config:
+                config.update(model_config)
+            config["trial_number"] = trial.number
+
+            self.wandb_run = wandb.init(
+                project=wandb_project,
+                config=config,
+                name=f"trial-{trial.number}",
+                group=wandb_group,
+                tags=["optuna"],
+                reinit=True,
+            )
 
     def on_epoch_end(self, epoch: int, metrics: dict[str, float]) -> bool:
         """
@@ -83,11 +111,25 @@ class OptunaCallback:
         # Report to Optuna
         self.trial.report(value, epoch)
 
+        # Log to W&B if enabled
+        if self.wandb_run:
+            import wandb
+
+            wandb.log(metrics, step=epoch)
+            wandb.run.summary["best_value"] = self.best_value
+
         # Check for pruning
         if self.pruning and self.trial.should_prune():
             raise optuna.TrialPruned()
 
         return True
+
+    def finish(self):
+        """Finish the W&B run if active."""
+        if self.wandb_run:
+            import wandb
+
+            wandb.finish()
 
 
 # =============================================================================
@@ -114,6 +156,7 @@ class OptunaOptimizer:
         model_class: type,
         search_space: Any,
         study_config: OptunaStudyConfig,
+        wandb_project: str | None = None,
     ):
         """
         Initialize the optimizer.
@@ -122,10 +165,12 @@ class OptunaOptimizer:
             model_class: Model class that has OptunaMixin (must have from_trial classmethod)
             search_space: Search space object appropriate for the model class
             study_config: Configuration for the Optuna study
+            wandb_project: W&B project name (enables W&B logging if provided)
         """
         self.model_class = model_class
         self.search_space = search_space
         self.study_config = study_config
+        self.wandb_project = wandb_project
 
     def create_objective(
         self,
@@ -158,15 +203,21 @@ class OptunaOptimizer:
                 num_workers=num_workers,
             )
 
-            # Create callback for pruning
+            # Create callback for pruning (with optional W&B logging)
             callback = OptunaCallback(
                 trial=trial,
                 metric=self.study_config.metric,
                 pruning=self.study_config.pruning,
+                wandb_project=self.wandb_project,
+                wandb_group=self.study_config.study_name if self.wandb_project else None,
             )
 
-            # Train with callback
-            model.train(train_dataset, val_dataset, callback=callback)
+            try:
+                # Train with callback
+                model.train(train_dataset, val_dataset, callback=callback)
+            finally:
+                # Always finish W&B run (even if pruned)
+                callback.finish()
 
             return callback.best_value
 

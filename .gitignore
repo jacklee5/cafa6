@@ -210,3 +210,5 @@ input/
 notebooks/
 
 .claude/
+wandb/
+checkpoints/

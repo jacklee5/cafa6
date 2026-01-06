@@ -4,6 +4,7 @@ Uses PyTorch with GPU acceleration and BCEWithLogitsLoss for 1vsRest classificat
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import optuna
 
@@ -41,7 +42,7 @@ class TrainingConfig:
     hidden_layers: list[int] = field(default_factory=lambda: [1024])
     dropout: float = 0.1006961784393873
     activation: str = "gelu"
-    batch_norm: bool = True
+    batch_norm: bool = False
     # Checkpointing
     use_checkpoint: bool = True
     checkpoint_path: str = "checkpoints"
@@ -51,7 +52,7 @@ class TrainingConfig:
 # Training
 # =============================================================================
 
-def train(config: TrainingConfig):
+def train(config: TrainingConfig, use_wandb: bool = False):
     """Main training function using ESMModel."""
     # Load training data
     print("Loading training data...")
@@ -99,9 +100,24 @@ def train(config: TrainingConfig):
         },
     }
 
+    # Setup W&B callback if enabled
+    callback = None
+    if use_wandb:
+        from utils.wandb import WandbCallback
+
+        callback = WandbCallback(
+            project="cafa6",
+            config=model_config,
+            name=f"train-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        )
+
     # Create and train model
     model = ESMModel(model_config)
-    model.train(train_dataset, val_dataset)
+    model.train(train_dataset, val_dataset, callback=callback)
+
+    # Finish W&B run
+    if callback:
+        callback.finish()
 
     # Save final model if no validation (train on all data for submission)
     if val_dataset is None:
@@ -125,6 +141,7 @@ def run_optuna_optimization(
     config: TrainingConfig,
     search_space: ESMSearchSpace,
     study_config: OptunaStudyConfig,
+    use_wandb: bool = False,
 ) -> optuna.Study:
     """
     Run Optuna hyperparameter optimization.
@@ -133,6 +150,7 @@ def run_optuna_optimization(
         config: Training configuration with data paths and fixed settings
         search_space: ESMSearchSpace defining hyperparameter search ranges
         study_config: OptunaStudyConfig for study settings
+        use_wandb: Enable W&B logging (each trial becomes a separate run)
 
     Returns:
         Completed Optuna study
@@ -163,7 +181,12 @@ def run_optuna_optimization(
     print(f"Val dataset: {len(val_dataset)} samples")
 
     # Create and run optimizer
-    optimizer = OptunaOptimizer(ESMModel, search_space, study_config)
+    optimizer = OptunaOptimizer(
+        ESMModel,
+        search_space,
+        study_config,
+        wandb_project="cafa6" if use_wandb else None,
+    )
     study = optimizer.run_study(
         train_dataset,
         val_dataset,
@@ -186,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--optuna", action="store_true", help="Run Optuna hyperparameter optimization")
     parser.add_argument("--n-trials", type=int, default=100, help="Number of Optuna trials")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -195,25 +219,42 @@ if __name__ == "__main__":
         val_ids_path="data/val/proteins.pkl",
         pooling="all",
         epochs=args.epochs,
+        hidden_layers=[1024, 1024, 1024, 1024],
+        dropout=0.2,
+        activation="gelu",
+        batch_size=256,
+        learning_rate=0.001,
+        weight_decay=5e-5,
+        use_checkpoint=False,
+        batch_norm=True
     )
 
     if args.optuna:
         # Run Optuna hyperparameter optimization
+        # search_space = ESMSearchSpace(
+        #     hidden_layer_choices=[[], [512], [1024], [512, 256], [1024, 512]],
+        #     dropout_range=(0, 0.8),
+        #     activation_choices=["relu", "gelu", "silu"],
+        #     batch_size_choices=[128, 256, 512],
+        #     learning_rate_range=(1e-5, 1e-3),
+        #     weight_decay_range=(1e-4, 1e-1),
+        # ) study 1 - 12/30 2pm
         search_space = ESMSearchSpace(
-            hidden_layer_choices=[[], [512], [1024], [512, 256], [1024, 512]],
-            dropout_range=(0.1, 0.5),
-            activation_choices=["relu", "gelu", "silu"],
-            batch_size_choices=[128, 256, 512],
-            learning_rate_range=(1e-5, 1e-2),
-            weight_decay_range=(1e-6, 1e-3),
-        )
+            hidden_layer_choices=[[4096], [8192]],
+            dropout_range=(0.2, 0.2),
+            activation_choices=["gelu"],
+            batch_size_choices=[256],
+            learning_rate_range=(1e-3, 1e-3),
+            weight_decay_range=(5e-5, 5e-5),
+        ) # study 2 - 12/30 3pm
         study_config = OptunaStudyConfig(
             n_trials=args.n_trials,
             study_name="protein_mlp_optimization",
             pruning=True,
             metric="f1",
         )
-        study = run_optuna_optimization(config, search_space, study_config)
+        study = run_optuna_optimization(config, search_space, study_config, use_wandb=args.wandb)
     else:
         # Standard training with best hyperparameters from Optuna
-        model, top_terms = train(config)
+        model, top_terms = train(config, use_wandb=args.wandb)
+        # 4096: 332864

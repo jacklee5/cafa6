@@ -86,6 +86,7 @@ class EmbeddingDataset(Dataset):
         # Load embeddings
         embeddings = np.load(embeddings_path)
         embeddings = slice_embeddings_by_pooling(embeddings, pooling)
+        self._pooling = pooling
 
         # Load protein IDs
         with open(ids_path, "rb") as f:
@@ -149,3 +150,8 @@ class EmbeddingDataset(Dataset):
     def top_terms(self) -> list[str]:
         """Return list of GO term IDs in prediction order."""
         return self._top_terms
+    
+    @property
+    def pooling(self) -> str:
+        """Return pooling mode used."""
+        return self._pooling

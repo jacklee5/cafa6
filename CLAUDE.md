@@ -41,6 +41,7 @@ kaggle competitions download -c cafa-6-protein-function-prediction -p input/cafa
 - **ete3** - NCBI taxonomy lookups (`NCBITaxa`)
 - **obonet** - Parsing GO ontology (go-basic.obo)
 - **numpy/pandas** - Data manipulation
+- **seaborn** - For plotting charts
 
 ## Architecture Notes from CAFA 5
 

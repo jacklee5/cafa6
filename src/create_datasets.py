@@ -90,11 +90,11 @@ train_embeddings_esm1b = np.load(get_data_path(DatasetPaths.ESM1B, "train_esm1b_
 embeddings_df_esm1b = pd.DataFrame(train_embeddings_esm1b, index=taxonomy_df["uniprot_id"])
 
 np.save(
-    "data/train/embeddings.npy",
+    "data/train/embeddings_esm1b.npy",
     embeddings_df_esm1b.loc[train_proteins].values,
 )
 np.save(
-    "data/val/embeddings.npy",
+    "data/val/embeddings_esm1b.npy",
     embeddings_df_esm1b.loc[val_proteins].values,
 )
 
@@ -125,10 +125,19 @@ np.save(
     embeddings_df_esm2.loc[val_proteins_in_esm2].values,
 )
 
-# Save the protein lists for ESM2 (in case some are missing)
-with open("data/train/proteins_esm2.pkl", "wb") as f:
-    pickle.dump(train_proteins_in_esm2, f)
-with open("data/val/proteins_esm2.pkl", "wb") as f:
-    pickle.dump(val_proteins_in_esm2, f)
-
 print(f"Saved ESM2 embeddings: train {len(train_proteins_in_esm2)}x{esm2_embeddings.shape[1]}, val {len(val_proteins_in_esm2)}x{esm2_embeddings.shape[1]}")
+
+# Create ground truth file
+print("\n--- Ground Truth ---")
+train_terms_df = pd.read_csv(
+    get_data_path(DatasetPaths.CAFA6, "Train/train_terms.tsv"),
+    sep="\t",
+)
+val_terms_df = train_terms_df[train_terms_df["EntryID"].isin(val_proteins)]
+val_terms_df[["EntryID", "term"]].to_csv(
+    "data/val/ground_truth.tsv",
+    sep="\t",
+    index=False,
+    header=False,
+)
+print(f"Saved ground truth: {len(val_terms_df)} entries for {val_terms_df['EntryID'].nunique()} proteins")

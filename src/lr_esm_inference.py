@@ -22,15 +22,15 @@ from models import ESMModel
 class InferenceConfig:
     """Configuration for inference."""
     # Model checkpoint (contains model weights, architecture, and GO terms)
-    model_path: str = "best_model.pt"
+    model_path: str
 
     # Test embeddings
-    test_embeddings_path: str = "input/esm1b-embeddings/test_esm1b_embeddings.npy"
-    test_ids_path: str = "input/esm1b-embeddings/test_ids.pkl"
+    test_embeddings_path: str
+    test_ids_path: str
 
     # Output
-    output_path: str = "submission.tsv"
-    threshold: float = 0.01  # Minimum probability to include prediction
+    output_path: str
+    threshold: float # Minimum probability to include prediction
 
 
 # =============================================================================
@@ -132,10 +132,30 @@ def run_inference(config: InferenceConfig):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run inference on ESM model")
+    parser.add_argument("model_path", type=str, help="Path to model checkpoint")
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="submissions/submission.tsv",
+        help="Output path for submission file (default: submissions/submission.tsv)",
+    )
+    parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.01,
+        help="Minimum probability threshold (default: 0.01)",
+    )
+    args = parser.parse_args()
+
     config = InferenceConfig(
-        model_path="checkpoints/esm_20241229_120000.pt",  # Update with actual checkpoint
-        output_path="submissions/submission.tsv",
-        threshold=0.01,
+        model_path=args.model_path,
+        output_path=args.output,
+        threshold=args.threshold,
+        test_embeddings_path="data/val/embeddings_esm2.npy",
+        test_ids_path="data/val/proteins.pkl",
     )
 
     run_inference(config)

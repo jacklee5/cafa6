@@ -15,6 +15,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from dataset.EmbeddingDataset import EmbeddingDataset
+
 from .Model import Model, TrainingCallback
 
 if TYPE_CHECKING:
@@ -263,8 +265,8 @@ class ESMModel(Model, OptunaMixin):
 
     def train(
         self,
-        train_dataset: Dataset,
-        val_dataset: Dataset | None = None,
+        train_dataset: EmbeddingDataset,
+        val_dataset: EmbeddingDataset | None = None,
         callback: TrainingCallback | None = None,
     ) -> "ESMModel":
         """
@@ -363,7 +365,10 @@ class ESMModel(Model, OptunaMixin):
                     epoch_metrics["is_best"] = True
                     print("  -> New best F1")
                     if self.use_checkpoint:
-                        self.save_checkpoint(self.checkpoint_path)
+                        self.save_checkpoint(self.checkpoint_path, extra_data={
+                            "top_terms": train_dataset.top_terms,
+                            "pooling": train_dataset.pooling,
+                        })
 
             self.history.append(epoch_metrics)
 
